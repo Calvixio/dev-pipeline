@@ -1,0 +1,44 @@
+# Default risk paths for risk-gate.yml.
+#
+# A calling repo can add to these in its own .github/risk-paths.yml (read from
+# the PR's BASE branch, never from the PR itself). Its ask_first entries are
+# ADDED to this list; it cannot remove a default. Its low_risk list, if given,
+# replaces the default low_risk list. Ask-first always wins over low-risk.
+#
+# Pattern rules (case-insensitive):
+#   - a pattern containing "/" matches the whole path from the repo root
+#   - a pattern without "/" matches any single path segment, so "*auth*"
+#     catches app/auth/actions.ts and "package.json" catches nested ones too
+#   - "**" matches across "/", "*" and "?" do not
+
+ask_first:
+  # Database
+  - supabase/migrations/**
+  # Auth, billing, payments, webhooks: anywhere in a path segment
+  - "*auth*"
+  - "*billing*"
+  - "*stripe*"
+  - "*webhook*"
+  # Cloudflare Worker config (account, bindings, routes)
+  - wrangler.jsonc
+  - wrangler.toml
+  - wrangler.json
+  # Pipeline and rules machinery
+  - .github/**
+  - .github/risk-paths.yml   # explicit: a PR must not loosen the gate for later PRs
+  - CODEOWNERS
+  - AGENTS.md
+  - CLAUDE.md
+  # Dependencies
+  - package.json
+  - package-lock.json
+  - npm-shrinkwrap.json
+  - yarn.lock
+  - pnpm-lock.yaml
+  - bun.lock
+  - bun.lockb
+
+low_risk:
+  - docs/**
+  - "**/*.md"
+  - "**/*.css"

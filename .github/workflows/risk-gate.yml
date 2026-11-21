@@ -1,0 +1,174 @@
+name: risk-gate
+
+# Classifies a PR from its changed FILE PATHS only, never from PR text (an
+# agent can write anything in a PR description).
+#
+#   ask-first  any changed path matches an ask_first pattern. The check fails
+#              until an approver approves the PR *at its current head commit*;
+#              an approval of an older commit does not carry over a rebase.
+#   low-risk   every changed path matches a low_risk pattern.
+#   standard   everything else.
+#
+# Patterns: defaults in config/risk-paths.default.yml in this repo, plus the
+# caller's config file read from the PR's BASE commit, so a PR cannot edit
+# the config to wave itself through. The caller can add ask_first paths but
+# never remove the defaults.
+#
+# Callers trigger this on pull_request AND pull_request_review, so that an
+# approval re-runs the gate.
+
+on:
+  workflow_call:
+    inputs:
+      approvers:
+        description: Space-separated GitHub logins whose approval clears an ask-first PR.
+        type: string
+        default: HelpOnTheWay-bit
+      config_path:
+        description: Caller's risk-path config, read from the PR's base commit.
+        type: string
+        default: .github/risk-paths.yml
+      pipeline_repository:
+        type: string
+        default: Calvixio/dev-pipeline
+      pipeline_ref:
+        description: Keep this equal to the @ref in your `uses:` line.
+        type: string
+        default: main
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  gate:
+    name: risk gate
+    if: github.event.pull_request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # No checkout of the PR: only the API is read, so nothing from the PR
+      # can execute in this job.
+      - name: Fetch dev-pipeline defaults and scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.pipeline_repository }}
+          ref: ${{ inputs.pipeline_ref }}
+          path: .dev-pipeline
+          sparse-checkout: |
+            config
+            scripts
+
+      - name: Read changed files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Current and previous path of every file, so moving a file out of
+          # a protected folder still counts as touching it.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" \
+            --jq '.[] | .filename, (.previous_filename // empty)' > "$RUNNER_TEMP/files.txt"
+          count=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.changed_files')
+          # The files API stops at 3000 entries; anything that large is ask-first.
+          if [ "$count" -ge 3000 ]; then
+            echo "TOO_MANY_FILES=1" >> "$GITHUB_ENV"
+          fi
+          echo "$count changed file(s)."
+
+      - name: Read caller config from base commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+        run: |
+          command -v yq >/dev/null || { echo "::error::yq is not on this runner image."; exit 1; }
+          yq -o=json '.' .dev-pipeline/config/risk-paths.default.yml > "$RUNNER_TEMP/defaults.json"
+          status=$(gh api -H "Accept: application/vnd.github.raw" \
+            "repos/$GITHUB_REPOSITORY/contents/$CONFIG_PATH?ref=$BASE_SHA" \
+            > "$RUNNER_TEMP/caller.yml" 2> "$RUNNER_TEMP/caller.err" && echo ok || echo missing)
+          if [ "$status" = ok ]; then
+            yq -o=json '.' "$RUNNER_TEMP/caller.yml" > "$RUNNER_TEMP/caller.json"
+            echo "CALLER_CONFIG=$RUNNER_TEMP/caller.json" >> "$GITHUB_ENV"
+            echo "Using $CONFIG_PATH from base commit $BASE_SHA plus defaults."
+          elif grep -q "HTTP 404" "$RUNNER_TEMP/caller.err"; then
+            echo "CALLER_CONFIG=-" >> "$GITHUB_ENV"
+            echo "No $CONFIG_PATH at base commit; using defaults only."
+          else
+            echo "::error::Could not read $CONFIG_PATH from base commit:"
+            cat "$RUNNER_TEMP/caller.err"
+            exit 1
+          fi
+
+      - name: Classify
+        id: classify
+        run: |
+          risk=$(node .dev-pipeline/scripts/risk-gate.mjs "$RUNNER_TEMP/defaults.json" "$CALLER_CONFIG" \
+            "$RUNNER_TEMP/files.txt" "$RUNNER_TEMP/result.json")
+          if [ "${TOO_MANY_FILES:-0}" = 1 ]; then risk=ask-first; fi
+          echo "risk=$risk" >> "$GITHUB_OUTPUT"
+          echo "Risk: $risk"
+
+      - name: Label PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RISK: ${{ steps.classify.outputs.risk }}
+        run: |
+          gh label create low-risk  --repo "$GITHUB_REPOSITORY" --color 0e8a16 --description "risk-gate: only low-risk paths changed" --force
+          gh label create standard  --repo "$GITHUB_REPOSITORY" --color fbca04 --description "risk-gate: no ask-first paths changed" --force
+          gh label create ask-first --repo "$GITHUB_REPOSITORY" --color d93f0b --description "risk-gate: needs approval before merge" --force
+          remove=$(printf '%s\n' low-risk standard ask-first | grep -vx "$RISK" | paste -sd, -)
+          gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label "$RISK" --remove-label "$remove"
+
+      - name: Require approval for ask-first paths
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          APPROVERS: ${{ inputs.approvers }}
+          RISK: ${{ steps.classify.outputs.risk }}
+        run: |
+          {
+            echo "### Risk gate: \`$RISK\`"
+            echo
+            if [ "${TOO_MANY_FILES:-0}" = 1 ]; then
+              echo "3000 or more files changed; too many to classify, so treated as ask-first."
+            fi
+            node -e '
+              const r = require(process.argv[1]);
+              if (r.askFirst.length) {
+                console.log("Ask-first files:\n\n| File | Matched pattern |\n| --- | --- |");
+                for (const a of r.askFirst) console.log(`| \`${a.file}\` | \`${a.pattern}\` |`);
+              } else if (r.notLowRisk.length) {
+                console.log(`Standard: ${r.notLowRisk.length} file(s) outside the low-risk paths.`);
+              } else {
+                console.log("Every changed file is on a low-risk path.");
+              }
+            ' "$RUNNER_TEMP/result.json"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$RISK" != ask-first ]; then
+            echo "Not ask-first; passing."
+            exit 0
+          fi
+
+          # Latest review per approver, counted only if it is an APPROVED
+          # review of the current head commit.
+          approved_by=""
+          for login in $APPROVERS; do
+            state=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" \
+              --jq ".[] | select(.user.login == \"$login\") | select(.state != \"COMMENTED\") | [.state, .commit_id] | @tsv" | tail -n 1)
+            if [ "$(cut -f1 <<<"$state")" = APPROVED ] && [ "$(cut -f2 <<<"$state")" = "$HEAD_SHA" ]; then
+              approved_by="$login"
+              break
+            fi
+          done
+
+          if [ -n "$approved_by" ]; then
+            echo "Approved by $approved_by at $HEAD_SHA." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "**Waiting for approval** from one of: $APPROVERS, on head commit \`$HEAD_SHA\`. Approvals of earlier commits do not count." >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Ask-first paths changed. Needs an approving review from one of: $APPROVERS on commit $HEAD_SHA. See the job summary for the matching files."
+          exit 1
