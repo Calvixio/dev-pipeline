@@ -1,0 +1,15 @@
+# Copy to .github/CODEOWNERS in your project.
+#
+# GitHub reads CODEOWNERS from the PR's base branch. With branch protection's
+# "Require review from Code Owners" on (scripts/set-branch-protection.sh),
+# any PR touching these paths needs the owner's approval whatever the
+# workflows say. This is the backstop for a PR that edits its own checks.
+#
+# The owner must not be the identity agents push as: GitHub ignores an
+# approval from the PR's author. See dev-pipeline docs/agent-identity.md.
+
+/.github/          @HelpOnTheWay-bit
+/.github/CODEOWNERS @HelpOnTheWay-bit
+CODEOWNERS         @HelpOnTheWay-bit
+AGENTS.md          @HelpOnTheWay-bit
+CLAUDE.md          @HelpOnTheWay-bit
