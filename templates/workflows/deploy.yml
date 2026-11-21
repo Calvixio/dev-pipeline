@@ -1,0 +1,37 @@
+# Copy to .github/workflows/deploy.yml in your project.
+#
+# Deploy on push to main, smoke test the live URL, roll back on failure.
+# Needs a CLOUDFLARE_API_TOKEN repository secret scoped to this one account
+# with "Workers Scripts: Edit" (plus whatever bindings the Worker uses).
+# Test against a staging Worker first: docs/staging-checklist.md.
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+# Never two deploys at once; never cancel one halfway.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  deploy:
+    uses: Calvixio/dev-pipeline/.github/workflows/deploy-cloudflare.yml@v1  # TODO: pin
+    permissions:
+      contents: read
+      issues: write
+    with:
+      pipeline_ref: v1  # TODO: same as @ref above
+      account_id: 00000000000000000000000000000000  # TODO: the Cloudflare account this Worker lives in
+      deployed_url: https://example.com            # TODO
+      # wrangler_env: staging
+      # build_env: |                               # public build-time values only
+      #   NEXT_PUBLIC_SUPABASE_URL=https://xyz.supabase.co
+      smoke_paths: |
+        /
+    secrets:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

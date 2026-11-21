@@ -1,0 +1,320 @@
+name: deploy-cloudflare
+
+# Deploys an OpenNext/Cloudflare Worker on push to main, smoke tests the
+# deployed URL, and rolls back automatically if the smoke test fails.
+#
+#   1. Refuse to run unless the ref is the allowed one and the Worker config's
+#      account_id (if any) matches the account_id input.
+#   2. Record the currently deployed version (the rollback target).
+#   3. Build and deploy.
+#   4. Smoke test the deployed URL with the same Playwright check as CI.
+#   5. On smoke failure: wrangler rollback to the recorded version, fail the
+#      job, and open a GitHub issue (phone notification).
+#      On success: version ID and URL go to the job summary.
+#
+# Secrets: CLOUDFLARE_API_TOKEN is passed only to the steps that call
+# wrangler, through env, never on a command line. No step uses set -x.
+#
+# NOT YET RUN ANYWHERE. First run is against a staging Worker; see
+# docs/staging-checklist.md.
+
+on:
+  workflow_call:
+    inputs:
+      account_id:
+        description: Cloudflare account ID. Pinned so a deploy can't drift between accounts.
+        type: string
+        required: true
+      deployed_url:
+        description: Base URL of the deployed Worker, e.g. https://example.com
+        type: string
+        required: true
+      smoke_paths:
+        description: One path per line, "/path" or "/path | text that must appear".
+        type: string
+        required: true
+      wrangler_env:
+        description: Optional wrangler environment (e.g. staging). Empty for the top-level config.
+        type: string
+        default: ""
+      allowed_ref:
+        description: The only ref this workflow will deploy from.
+        type: string
+        default: refs/heads/main
+      node_version:
+        type: string
+        default: "24"
+      build_command:
+        type: string
+        default: npx opennextjs-cloudflare build
+      deploy_command:
+        description: Deploys the built Worker. Receives WRANGLER_ENV_FLAG (e.g. "--env staging" or empty).
+        type: string
+        default: npx opennextjs-cloudflare deploy $WRANGLER_ENV_FLAG
+      build_env:
+        description: Non-secret KEY=VALUE lines exported for the build (e.g. NEXT_PUBLIC_* values).
+        type: string
+        default: ""
+      smoke_delay_seconds:
+        description: Wait after deploy before smoke testing, for the new version to propagate.
+        type: number
+        default: 15
+      playwright_version:
+        type: string
+        default: "1.64.1"
+      pipeline_repository:
+        type: string
+        default: Calvixio/dev-pipeline
+      pipeline_ref:
+        description: Keep this equal to the @ref in your `uses:` line.
+        type: string
+        default: main
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+    outputs:
+      version_id:
+        description: The deployed Worker version ID.
+        value: ${{ jobs.deploy.outputs.version_id }}
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: deploy + smoke + rollback
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      version_id: ${{ steps.deploy.outputs.version_id }}
+    env:
+      WRANGLER_SEND_METRICS: "false"
+      NEXT_TELEMETRY_DISABLED: "1"
+      CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account_id }}
+      WRANGLER_ENV: ${{ inputs.wrangler_env }}
+    steps:
+      - name: Check ref and inputs
+        env:
+          ALLOWED_REF: ${{ inputs.allowed_ref }}
+          DEPLOYED_URL: ${{ inputs.deployed_url }}
+        run: |
+          if [ "$GITHUB_REF" != "$ALLOWED_REF" ]; then
+            echo "::error::Refusing to deploy $GITHUB_REF; only $ALLOWED_REF may deploy."
+            exit 1
+          fi
+          if ! [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "::error::account_id must be a 32-character hex Cloudflare account ID."
+            exit 1
+          fi
+          if ! [[ "$DEPLOYED_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?/?$ ]]; then
+            echo "::error::deployed_url must be an https:// origin, e.g. https://example.com"
+            exit 1
+          fi
+          if [ -n "$WRANGLER_ENV" ] && ! [[ "$WRANGLER_ENV" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "::error::wrangler_env may only contain letters, digits, - and _."
+            exit 1
+          fi
+          flag=""
+          [ -n "$WRANGLER_ENV" ] && flag="--env $WRANGLER_ENV"
+          echo "WRANGLER_ENV_FLAG=$flag" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Fetch dev-pipeline scripts
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.pipeline_repository }}
+          ref: ${{ inputs.pipeline_ref }}
+          path: .dev-pipeline
+          sparse-checkout: scripts
+          persist-credentials: false
+      - name: Move dev-pipeline scripts out of the workspace
+        run: mv .dev-pipeline "$RUNNER_TEMP/dev-pipeline"
+
+      # Belt and braces: CLOUDFLARE_ACCOUNT_ID already overrides, but a config
+      # pinned to a different account means someone pointed this at the
+      # wrong Worker.
+      - name: Check Worker config account matches account_id
+        run: |
+          for f in wrangler.jsonc wrangler.json wrangler.toml; do
+            [ -f "$f" ] || continue
+            found=$(grep -oE '"?account_id"?[[:space:]]*[:=][[:space:]]*"[0-9a-f]{32}"' "$f" | grep -oE '[0-9a-f]{32}' | sort -u || true)
+            for id in $found; do
+              if [ "$id" != "$CLOUDFLARE_ACCOUNT_ID" ]; then
+                echo "::error::$f pins account_id $id but this deploy is pinned to $CLOUDFLARE_ACCOUNT_ID."
+                exit 1
+              fi
+            done
+            echo "$f: account_id OK"
+          done
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Export build env
+        if: inputs.build_env != ''
+        env:
+          BUILD_ENV: ${{ inputs.build_env }}
+        run: |
+          printf '%s\n' "$BUILD_ENV" | while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if ! [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+              echo "::error::build_env lines must be KEY=VALUE."
+              exit 1
+            fi
+            echo "$line" >> "$GITHUB_ENV"
+          done
+
+      - name: Build
+        env:
+          CMD: ${{ inputs.build_command }}
+        run: bash -eo pipefail -c "$CMD"
+
+      - name: Record currently deployed version (rollback target)
+        id: previous
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          # shellcheck disable=SC2086
+          if npx --no-install wrangler deployments status --json $WRANGLER_ENV_FLAG > "$RUNNER_TEMP/before.json" 2> "$RUNNER_TEMP/before.err"; then
+            prev=$(node -e '
+              const d = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+              const v = (d.versions || []).sort((a, b) => b.percentage - a.percentage)[0];
+              process.stdout.write(v ? v.version_id : "");
+            ' "$RUNNER_TEMP/before.json")
+          else
+            prev=""
+            echo "Could not read current deployment (first deploy?):"
+            cat "$RUNNER_TEMP/before.err"
+          fi
+          echo "version_id=$prev" >> "$GITHUB_OUTPUT"
+          echo "Rollback target: ${prev:-none}"
+
+      - name: Deploy
+        id: deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CMD: ${{ inputs.deploy_command }}
+        run: |
+          bash -eo pipefail -c "$CMD"
+          # shellcheck disable=SC2086
+          npx --no-install wrangler deployments status --json $WRANGLER_ENV_FLAG > "$RUNNER_TEMP/after.json"
+          version=$(node -e '
+            const d = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+            const v = (d.versions || []).sort((a, b) => b.percentage - a.percentage)[0];
+            process.stdout.write(v ? v.version_id : "");
+          ' "$RUNNER_TEMP/after.json")
+          if [ -z "$version" ]; then
+            echo "::error::Deploy finished but no deployed version ID could be read."
+            exit 1
+          fi
+          echo "version_id=$version" >> "$GITHUB_OUTPUT"
+          echo "Deployed version $version"
+
+      - name: Wait for propagation
+        env:
+          DELAY: ${{ inputs.smoke_delay_seconds }}
+        run: sleep "$DELAY"
+
+      - name: Install Playwright
+        env:
+          PW_VERSION: ${{ inputs.playwright_version }}
+        run: |
+          dir="$RUNNER_TEMP/dev-pipeline/scripts"
+          npm install --prefix "$dir" --no-save --no-audit --no-fund "playwright@$PW_VERSION"
+          (cd "$dir" && npx --no-install playwright install --with-deps chromium)
+
+      - name: Smoke test the deployed URL
+        id: smoke
+        env:
+          URL: ${{ inputs.deployed_url }}
+          SMOKE_PATHS: ${{ inputs.smoke_paths }}
+        run: |
+          printf '%s\n' "$SMOKE_PATHS" > "$RUNNER_TEMP/smoke-paths.txt"
+          node "$RUNNER_TEMP/dev-pipeline/scripts/smoke.mjs" "$URL" "$RUNNER_TEMP/smoke-paths.txt" "$RUNNER_TEMP/screenshots"
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: deploy-smoke-screenshots
+          path: ${{ runner.temp }}/screenshots
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Roll back
+        id: rollback
+        if: failure() && steps.deploy.outcome == 'success'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PREV: ${{ steps.previous.outputs.version_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$PREV" ]; then
+            echo "result=impossible (no previous version recorded)" >> "$GITHUB_OUTPUT"
+            echo "::error::Smoke failed and there is no previous version to roll back to."
+            exit 1
+          fi
+          # shellcheck disable=SC2086
+          if npx --no-install wrangler rollback "$PREV" --message "Smoke test failed for ${SHA:0:7}" --yes $WRANGLER_ENV_FLAG; then
+            echo "result=rolled back to $PREV" >> "$GITHUB_OUTPUT"
+            echo "Rolled back to $PREV."
+          else
+            echo "result=ROLLBACK FAILED (target $PREV)" >> "$GITHUB_OUTPUT"
+            echo "::error::Rollback to $PREV failed. Production is running the failing version."
+            exit 1
+          fi
+
+      - name: Open an issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          URL: ${{ inputs.deployed_url }}
+          NEW_VERSION: ${{ steps.deploy.outputs.version_id }}
+          PREV: ${{ steps.previous.outputs.version_id }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
+          ROLLBACK_RESULT: ${{ steps.rollback.outputs.result }}
+        run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            echo "Deploy of \`$SHA\` to $URL failed."
+            echo
+            echo "- Deploy step: $DEPLOY_OUTCOME"
+            echo "- Smoke test: ${SMOKE_OUTCOME:-not run}"
+            echo "- New version: ${NEW_VERSION:-none}"
+            echo "- Rollback: ${ROLLBACK_RESULT:-not attempted (deploy did not complete)}"
+            echo "- Previous version: ${PREV:-none recorded}"
+            echo
+            echo "Run, logs and screenshots: $run_url"
+          } > "$RUNNER_TEMP/issue.md"
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "Deploy failed: $GITHUB_REPOSITORY ${SHA:0:7}" \
+            --body-file "$RUNNER_TEMP/issue.md"
+
+      - name: Summary
+        if: success()
+        env:
+          URL: ${{ inputs.deployed_url }}
+          VERSION: ${{ steps.deploy.outputs.version_id }}
+          PREV: ${{ steps.previous.outputs.version_id }}
+        run: |
+          {
+            echo "### Deployed"
+            echo
+            echo "- Version ID: \`$VERSION\`"
+            echo "- URL: $URL"
+            echo "- Previous version (rollback target): \`${PREV:-none}\`"
+            echo "- Environment: ${WRANGLER_ENV:-top-level}"
+          } >> "$GITHUB_STEP_SUMMARY"

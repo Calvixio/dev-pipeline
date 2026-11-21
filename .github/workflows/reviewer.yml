@@ -1,0 +1,238 @@
+name: reviewer
+
+# Independent Claude review of a PR's diff. Posts its findings as a PR review
+# and fails the check when it finds a blocking issue.
+#
+# Two jobs, so the agent never holds a write token:
+#   review  contents: read only. Trusted steps write the diff, commit list and
+#           (after a rebase) the range-diff to files; Claude gets Read, Grep
+#           and Glob only, and returns its verdict as structured output.
+#   post    pull-requests: write. Plain script, no agent: posts the review
+#           and fails on a blocking verdict.
+#
+# The PR's own agent config (.claude/, CLAUDE.md, .mcp.json) is deleted from
+# the checkout before Claude runs so a PR cannot configure its own reviewer.
+# Those files still appear in the diff Claude reviews.
+#
+# The prompt lives in prompts/reviewer.md in this repo so it can be tuned.
+# Deliberately NOT given to the reviewer: the PR title and description. An
+# agent can write anything there.
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        type: string
+        default: claude-opus-5-5
+      max_turns:
+        type: number
+        default: 40
+      pipeline_repository:
+        type: string
+        default: Calvixio/dev-pipeline
+      pipeline_ref:
+        description: Keep this equal to the @ref in your `uses:` line.
+        type: string
+        default: main
+      timeout_minutes:
+        type: number
+        default: 20
+    # Pass one of these. CLAUDE_CODE_OAUTH_TOKEN (a Claude subscription,
+    # from `claude setup-token`) wins when both are set; ANTHROPIC_API_KEY
+    # (Console, billed per token) is the fallback. A repo switches by
+    # swapping which secret it sets. Neither is required here, so a missing
+    # secret fails with a clear message instead of a generic workflow error.
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      ANTHROPIC_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    name: independent review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    permissions:
+      contents: read
+    outputs:
+      review: ${{ steps.claude.outputs.structured_output }}
+    steps:
+      # Secrets reach this script only through env. Never write a ${{ }}
+      # expression inside run: text, even escaped or as help text: GitHub
+      # expands it before the shell sees it, which would paste the secret
+      # into the script. Only which secret is present is ever printed.
+      - name: Check a Claude credential is set
+        env:
+          OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$OAUTH" ]; then
+            echo "Using CLAUDE_CODE_OAUTH_TOKEN (Claude subscription; counts against its usage limits)."
+          elif [ -n "$KEY" ]; then
+            echo "Using ANTHROPIC_API_KEY (Console API key, billed per token)."
+          else
+            echo "::error title=No Claude credential set::Neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set. Add one as a repository secret (gh secret set CLAUDE_CODE_OAUTH_TOKEN -R ${GITHUB_REPOSITORY}, or gh secret set ANTHROPIC_API_KEY -R ${GITHUB_REPOSITORY}) and pass it from the caller under 'secrets:' as in templates/workflows/pr-checks.yml. Secrets are also unavailable to PRs from forks."
+            exit 1
+          fi
+
+      - name: Check out PR head with full history
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Remove PR-controlled agent config
+        run: |
+          rm -rf .claude .mcp.json CLAUDE.md CLAUDE.local.md .review
+          echo "Removed any .claude/, .mcp.json, CLAUDE.md, CLAUDE.local.md from the working tree (still visible in the diff)."
+
+      - name: Fetch dev-pipeline prompt
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.pipeline_repository }}
+          ref: ${{ inputs.pipeline_ref }}
+          path: .dev-pipeline
+          sparse-checkout: prompts
+          persist-credentials: false
+      - name: Move dev-pipeline files out of the workspace
+        run: mv .dev-pipeline "$RUNNER_TEMP/dev-pipeline"
+
+      # Trusted step: everything Claude needs from git, written to files.
+      # Rebase detection: on a push to the PR, if the previous head is not an
+      # ancestor of the new one, the branch was rewritten (rebase/force-push).
+      - name: Write diff, commits and rebase context
+        id: ctx
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          ACTION: ${{ github.event.action }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          mkdir -p .review
+          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          git -c core.quotePath=false diff --no-ext-diff --no-textconv --stat "$merge_base" "$HEAD_SHA" > .review/stat.txt
+          git diff --no-ext-diff --no-textconv "$merge_base" "$HEAD_SHA" > .review/pr.diff
+          git log --format='%h %an %ad%n    %s' --date=short "$merge_base..$HEAD_SHA" > .review/commits.txt
+
+          rebase_note="This push was not a rebase (or no previous head is known)."
+          if [ "$ACTION" = "synchronize" ] && [ -n "$BEFORE_SHA" ]; then
+            if ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+              # The old head of a force-pushed branch is unreachable from any
+              # ref, but GitHub usually still serves it by SHA.
+              git fetch --no-tags "$SERVER_URL/$GITHUB_REPOSITORY" "$BEFORE_SHA" 2>/dev/null \
+                || echo "Could not fetch previous head $BEFORE_SHA."
+            fi
+            if git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+              if git merge-base --is-ancestor "$BEFORE_SHA" "$HEAD_SHA"; then
+                rebase_note="This push added commits on top of the previous head ($BEFORE_SHA); no history was rewritten."
+              else
+                old_base=$(git merge-base "$BASE_SHA" "$BEFORE_SHA")
+                git range-diff --no-color "$old_base..$BEFORE_SHA" "$merge_base..$HEAD_SHA" > .review/range-diff.txt
+                rebase_note="THE BRANCH WAS REBASED OR FORCE-PUSHED in this push (previous head $BEFORE_SHA). .review/range-diff.txt compares every commit before and after."
+              fi
+            else
+              rebase_note="The previous head $BEFORE_SHA could not be fetched, so the branch was probably force-pushed. Treat this as a possible rebase and check the full diff with extra care."
+            fi
+          fi
+
+          delim="PROMPT_$(openssl rand -hex 16)"
+          {
+            echo "prompt<<$delim"
+            cat "$RUNNER_TEMP/dev-pipeline/prompts/reviewer.md"
+            echo
+            echo "## Context for this run"
+            echo
+            echo "- Repository: $GITHUB_REPOSITORY, PR #$PR_NUMBER"
+            echo "- Base: $BASE_SHA; merge base: $merge_base; head: $HEAD_SHA (checked out in the working tree)"
+            echo "- Full diff: .review/pr.diff (file list: .review/stat.txt)"
+            echo "- Commits: .review/commits.txt"
+            echo "- Rebase status: $rebase_note"
+            echo "- You have Read, Grep and Glob only. Use them on the diff files and the checked-out code."
+            echo "$delim"
+          } >> "$GITHUB_OUTPUT"
+          echo "Rebase status: $rebase_note"
+
+      - name: Build reviewer arguments
+        id: args
+        env:
+          MODEL: ${{ inputs.model }}
+          MAX_TURNS: ${{ inputs.max_turns }}
+        run: |
+          schema='{"type":"object","additionalProperties":false,"required":["verdict","summary","findings"],"properties":{"verdict":{"type":"string","enum":["pass","block"]},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","file","title","detail"],"properties":{"severity":{"type":"string","enum":["blocking","warning","nit"]},"file":{"type":"string"},"line":{"type":"integer"},"title":{"type":"string"},"detail":{"type":"string"}}}}}}'
+          echo "claude_args=--model $MODEL --max-turns $MAX_TURNS --allowedTools \"Read,Grep,Glob\" --disallowedTools \"Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch\" --json-schema '$schema'" >> "$GITHUB_OUTPUT"
+
+      - name: Run independent review
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Exactly one credential goes to the action: the OAuth token if set,
+          # otherwise the API key. (Expressions in `with:` are not shell text.)
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN == '' && secrets.ANTHROPIC_API_KEY || '' }}
+          # This job's token is contents: read only.
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.ctx.outputs.prompt }}
+          claude_args: ${{ steps.args.outputs.claude_args }}
+          display_report: "false"
+
+      - name: Check the reviewer returned a verdict
+        env:
+          REVIEW: ${{ steps.claude.outputs.structured_output }}
+        run: |
+          if [ -z "$REVIEW" ]; then
+            echo "::error::The reviewer returned no structured output, so there is no verdict. Treating as a failure."
+            exit 1
+          fi
+          echo "Structured output received."
+
+  post:
+    name: post review
+    needs: review
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Fetch dev-pipeline scripts
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.pipeline_repository }}
+          ref: ${{ inputs.pipeline_ref }}
+          path: .dev-pipeline
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Post review and set verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEW: ${{ needs.review.outputs.review }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf '%s' "$REVIEW" > "$RUNNER_TEMP/review.json"
+          verdict=$(node .dev-pipeline/scripts/post-review.mjs "$RUNNER_TEMP/review.json" "$RUNNER_TEMP/review-body.md")
+          node -e '
+            const fs = require("fs");
+            fs.writeFileSync(process.argv[1], JSON.stringify({
+              commit_id: process.env.HEAD_SHA,
+              event: "COMMENT",
+              body: fs.readFileSync(process.argv[2], "utf8"),
+            }));
+          ' "$RUNNER_TEMP/review-request.json" "$RUNNER_TEMP/review-body.md"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" \
+            --input "$RUNNER_TEMP/review-request.json" --jq '.html_url'
+          cat "$RUNNER_TEMP/review-body.md" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$verdict" = "block" ]; then
+            echo "::error::Reviewer found blocking issues. See the PR review."
+            exit 1
+          fi
+          echo "Reviewer verdict: pass"

@@ -1,0 +1,267 @@
+name: ci-opennext
+
+# Reusable CI for Next.js apps deployed to Cloudflare through OpenNext.
+#
+# The point of this workflow is the last part: it starts the *built* Worker
+# locally with the OpenNext/wrangler preview and loads real pages in a real
+# browser. Next 16.4.6 on OpenNext 1.20.3 passed lint, typecheck and build
+# but returned a 500 on every page. Only a preview of the built output
+# catches that class of failure.
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        description: Node.js version for actions/setup-node.
+        type: string
+        default: "24"
+      lint_command:
+        type: string
+        default: npm run lint
+      typecheck_command:
+        type: string
+        default: npx tsc --noEmit
+      test_command:
+        description: Runs only when package.json has a "test" script.
+        type: string
+        default: npm test
+      build_command:
+        type: string
+        default: npx opennextjs-cloudflare build
+      preview_command:
+        description: Starts the built Worker locally. Must keep running in the foreground.
+        type: string
+        default: npx opennextjs-cloudflare preview
+      preview_url:
+        description: Where the preview answers once it is up.
+        type: string
+        default: http://localhost:8787
+      preview_timeout_seconds:
+        type: number
+        default: 180
+      preview_vars:
+        description: >
+          Non-secret KEY=VALUE lines written to .dev.vars for the preview
+          (runtime env). ${SUPABASE_URL}, ${SUPABASE_ANON_KEY} and
+          ${SUPABASE_SERVICE_ROLE_KEY} are expanded when use_supabase is true.
+          Never put real secrets here: this is a caller workflow file.
+        type: string
+        default: ""
+      smoke_paths:
+        description: One path per line, "/path" or "/path | text that must appear".
+        type: string
+        required: true
+      use_supabase:
+        description: Start local Supabase and run db reset (migrations + seed.sql) before the build.
+        type: boolean
+        default: false
+      supabase_cli_version:
+        description: Empty = use the version in the project lockfile (supabase devDependency), else latest.
+        type: string
+        default: ""
+      playwright_version:
+        type: string
+        default: "1.64.1"
+      pipeline_repository:
+        description: Where to fetch the shared smoke script from.
+        type: string
+        default: Calvixio/dev-pipeline
+      pipeline_ref:
+        description: Keep this equal to the @ref in your `uses:` line.
+        type: string
+        default: main
+      timeout_minutes:
+        type: number
+        default: 30
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: build + preview smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    env:
+      WRANGLER_SEND_METRICS: "false"
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - name: Check out caller repo
+        uses: actions/checkout@v7
+
+      # Fetched into the workspace (checkout cannot write outside it), then
+      # moved to RUNNER_TEMP so the caller's lint and build never see it.
+      - name: Fetch dev-pipeline scripts
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.pipeline_repository }}
+          ref: ${{ inputs.pipeline_ref }}
+          path: .dev-pipeline
+          sparse-checkout: scripts
+      - name: Move dev-pipeline scripts out of the workspace
+        run: mv .dev-pipeline "$RUNNER_TEMP/dev-pipeline"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # Before the build: Next inlines NEXT_PUBLIC_* at build time.
+      - name: Set up Supabase CLI
+        if: inputs.use_supabase
+        uses: supabase/setup-cli@v3
+        with:
+          version: ${{ inputs.supabase_cli_version }}
+      - name: Start local Supabase and apply migrations + seed
+        if: inputs.use_supabase
+        run: |
+          supabase start
+          supabase db reset
+          # Local dev keys only (well-known, throwaway). Masked anyway.
+          supabase status -o env > "$RUNNER_TEMP/supabase.env"
+          get() { grep -E "^$1=" "$RUNNER_TEMP/supabase.env" | head -1 | cut -d= -f2- | tr -d '"'; }
+          url=$(get API_URL); anon=$(get ANON_KEY); service=$(get SERVICE_ROLE_KEY)
+          if [ -z "$url" ] || [ -z "$anon" ]; then
+            echo "::error::supabase status did not report API_URL and ANON_KEY"
+            exit 1
+          fi
+          echo "::add-mask::$anon"
+          [ -n "$service" ] && echo "::add-mask::$service"
+          {
+            echo "SUPABASE_URL=$url"
+            echo "SUPABASE_ANON_KEY=$anon"
+            echo "SUPABASE_SERVICE_ROLE_KEY=$service"
+            echo "NEXT_PUBLIC_SUPABASE_URL=$url"
+            echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=$anon"
+          } >> "$GITHUB_ENV"
+
+      - name: Lint
+        env:
+          CMD: ${{ inputs.lint_command }}
+        run: bash -eo pipefail -c "$CMD"
+
+      - name: Typecheck
+        env:
+          CMD: ${{ inputs.typecheck_command }}
+        run: bash -eo pipefail -c "$CMD"
+
+      - name: Unit tests (if a test script exists)
+        env:
+          CMD: ${{ inputs.test_command }}
+        run: |
+          if node -e 'process.exit(require("./package.json").scripts?.test ? 0 : 1)'; then
+            bash -eo pipefail -c "$CMD"
+          else
+            echo "No \"test\" script in package.json, skipping."
+          fi
+
+      - name: OpenNext build
+        env:
+          CMD: ${{ inputs.build_command }}
+        run: bash -eo pipefail -c "$CMD"
+
+      - name: Write .dev.vars for the preview
+        if: inputs.preview_vars != '' || inputs.use_supabase
+        env:
+          PREVIEW_VARS: ${{ inputs.preview_vars }}
+        run: |
+          if [ -e .dev.vars ]; then
+            echo "::error::.dev.vars already exists in the checkout. It should never be committed."
+            exit 1
+          fi
+          {
+            if [ -n "${SUPABASE_URL:-}" ]; then
+              echo "NEXT_PUBLIC_SUPABASE_URL=$SUPABASE_URL"
+              echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=$SUPABASE_ANON_KEY"
+            fi
+            # Only the Supabase variables are expanded; anything else stays literal.
+            # shellcheck disable=SC2016
+            printf '%s\n' "$PREVIEW_VARS" | envsubst '${SUPABASE_URL} ${SUPABASE_ANON_KEY} ${SUPABASE_SERVICE_ROLE_KEY}'
+          } > .dev.vars
+          echo "Wrote .dev.vars with keys:"
+          grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' .dev.vars | tr -d '=' | sed 's/^/  /'
+
+      - name: Start preview and wait until it answers
+        env:
+          CMD: ${{ inputs.preview_command }}
+          URL: ${{ inputs.preview_url }}
+          TIMEOUT: ${{ inputs.preview_timeout_seconds }}
+        run: |
+          nohup bash -c "$CMD" > "$RUNNER_TEMP/preview.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/preview.pid"
+          deadline=$((SECONDS + TIMEOUT))
+          until code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$URL") && [ "$code" != "000" ]; do
+            if ! kill -0 "$(cat "$RUNNER_TEMP/preview.pid")" 2>/dev/null; then
+              echo "::error::Preview process exited before answering. Last log lines:"
+              tail -n 80 "$RUNNER_TEMP/preview.log"
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::Preview did not answer at $URL within ${TIMEOUT}s. Last log lines:"
+              tail -n 80 "$RUNNER_TEMP/preview.log"
+              exit 1
+            fi
+            sleep 3
+          done
+          echo "Preview answered at $URL with HTTP $code after ${SECONDS}s."
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ inputs.playwright_version }}
+
+      # Installed outside the caller's project so it never touches their
+      # lockfile, at a pinned version.
+      - name: Install Playwright
+        env:
+          PW_VERSION: ${{ inputs.playwright_version }}
+        run: |
+          dir="$RUNNER_TEMP/dev-pipeline/scripts"
+          npm install --prefix "$dir" --no-save --no-audit --no-fund "playwright@$PW_VERSION"
+          (cd "$dir" && npx --no-install playwright install --with-deps chromium)
+
+      - name: Smoke test the preview
+        env:
+          URL: ${{ inputs.preview_url }}
+          SMOKE_PATHS: ${{ inputs.smoke_paths }}
+        run: |
+          printf '%s\n' "$SMOKE_PATHS" > "$RUNNER_TEMP/smoke-paths.txt"
+          node "$RUNNER_TEMP/dev-pipeline/scripts/smoke.mjs" "$URL" "$RUNNER_TEMP/smoke-paths.txt" "$RUNNER_TEMP/screenshots"
+
+      - name: Show preview log on failure
+        if: failure()
+        run: |
+          if [ -f "$RUNNER_TEMP/preview.log" ]; then
+            tail -n 200 "$RUNNER_TEMP/preview.log"
+          else
+            echo "No preview log (the preview never started)."
+          fi
+
+      - name: Stop preview
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/preview.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/preview.pid")" 2>/dev/null || echo "Preview already stopped."
+          fi
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-screenshots
+          path: ${{ runner.temp }}/screenshots
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload preview log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: preview-log
+          path: ${{ runner.temp }}/preview.log
+          if-no-files-found: ignore
+          retention-days: 14

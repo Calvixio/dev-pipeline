@@ -1,0 +1,30 @@
+# Copy to .github/workflows/risk-gate.yml in your project.
+#
+# Runs on pull_request and again on every review, so an approval clears an
+# ask-first PR without a re-push. Kept separate from pr-checks.yml so review
+# events never create skipped (= passing) CI checks.
+
+name: Risk gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+concurrency:
+  group: risk-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  risk-gate:
+    uses: Calvixio/dev-pipeline/.github/workflows/risk-gate.yml@v1  # TODO: pin
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      pipeline_ref: v1  # TODO: same as @ref above
+      approvers: HelpOnTheWay-bit
+      # config_path: .github/risk-paths.yml   (default; read from the base branch)
