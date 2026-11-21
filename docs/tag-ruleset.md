@@ -46,13 +46,49 @@ It needs `gh` logged in as a repo admin.
    git push origin :refs/tags/v0.0.0-ruleset-check                   # must be REJECTED
    ```
    Both must fail, even as admin. The check tag then stays forever; that's
-   expected and harmless.
-3. **Major tag bypass:** check in the web UI (Settings → Rules → Rulesets →
-   "Major tags are admin-only") that the bypass list shows **Repository admin**.
-   The script uses `RepositoryRole` actor ID 5 for that role. If the UI shows
-   something else, fix it there and update the script.
-4. From a non-admin identity (e.g. the agent identity, once it exists),
+   expected and harmless. On Calvixio/dev-pipeline it already exists, so
+   re-verify there by skipping the first line.
+3. **Major tag bypass:** confirm actor ID 5 is the Repository admin role.
+   REST only returns the ID; GraphQL names it:
+   ```sh
+   gh api graphql -f query='query { repository(owner:"Calvixio", name:"dev-pipeline") {
+     rulesets(first:10) { nodes { databaseId name bypassActors(first:10) {
+       nodes { bypassMode repositoryRoleName repositoryRoleDatabaseId } } } } } }'
+   ```
+   Or check in the web UI (Settings → Rules → Rulesets → "Major tags are
+   admin-only") that the bypass list shows **Repository admin**.
+4. As admin, moving `v1` must succeed (git reports "Bypassed rule
+   violations for refs/tags/v1").
+5. From a non-admin identity (e.g. the agent identity, once it exists),
    `git push --force origin v1` must be rejected.
+
+## Applied on Calvixio/dev-pipeline (2026-11-21)
+
+Applied by Claude with Dan's go-ahead; the force-push checks were run by
+Dan, because a safety hook holds force-pushes from agent sessions.
+
+| Ruleset | ID | Enforcement |
+| --- | --- | --- |
+| Release tags are immutable (`refs/tags/v*.*.*`, update + deletion, no bypass) | 27802441 | active |
+| Major tags are admin-only (`refs/tags/v1`, creation + update + deletion, bypass: admin) | 27802442 | active |
+
+| Check | Result |
+| --- | --- |
+| Bypass actor ID 5 is the admin role | ✅ GraphQL: `repositoryRoleName: "admin"`, `repositoryRoleDatabaseId: 5`, `bypassMode: ALWAYS`. REST: `current_user_can_bypass` is `always` for 27802442, `never` for 27802441. |
+| New release tags can still be created | ✅ `v1.0.1` and `v0.0.0-ruleset-check` were pushed with both rulesets active. |
+| Deleting a release tag is refused, even as admin | ✅ `GH013 … Cannot delete this tag` on `v0.0.0-ruleset-check`. |
+| Moving a release tag is refused, even as admin | ✅ `GH013 … Cannot update this protected ref` on `v0.0.0-ruleset-check` (run by Dan). |
+| Admin can still move `v1` | ✅ Dan's force-push printed "Bypassed rule violations for refs/tags/v1". |
+| Non-admin cannot move `v1` | ⏳ Not yet tested; needs the agent identity (see [agent-identity.md](agent-identity.md)). |
+
+Tags after the checks:
+
+| Tag | Commit |
+| --- | --- |
+| `v1` | `2f8fd75242004e3d97f6f54e38615ab2a3e5e43c` (= `v1.0.1`) |
+| `v1.0.1` | `2f8fd75242004e3d97f6f54e38615ab2a3e5e43c` |
+| `v1.0.0` | `620ca9b4d10a79b5ee6f5688096bbaeee65433ef` |
+| `v0.0.0-ruleset-check` | `066f298e02d96424e93c3cea105b20e044a9043b` (permanent check tag; can't be deleted by design) |
 
 ## Releasing a new version
 
