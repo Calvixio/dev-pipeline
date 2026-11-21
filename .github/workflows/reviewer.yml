@@ -1,0 +1,175 @@
+name: reviewer
+
+# Independent Claude review of a PR's diff. Posts its findings as a PR review
+# and fails the check when it finds a blocking issue.
+#
+# Claude gets read-only tools and no GitHub write token. Its verdict comes
+# back as structured output; a plain script then posts the review and decides
+# pass/fail, so the reviewer cannot post, push or approve anything itself.
+#
+# The prompt lives in prompts/reviewer.md in this repo so it can be tuned.
+# Deliberately NOT given to the reviewer: the PR title and description. An
+# agent can write anything there.
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        type: string
+        default: claude-opus-5-5
+      max_turns:
+        type: number
+        default: 40
+      pipeline_repository:
+        type: string
+        default: Calvixio/dev-pipeline
+      pipeline_ref:
+        description: Keep this equal to the @ref in your `uses:` line.
+        type: string
+        default: main
+      timeout_minutes:
+        type: number
+        default: 20
+    secrets:
+      ANTHROPIC_API_KEY:
+        # Not required here so a missing key fails with a clear message
+        # instead of a generic workflow error.
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: independent review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    steps:
+      - name: Check ANTHROPIC_API_KEY is set
+        env:
+          KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error title=ANTHROPIC_API_KEY not set::ANTHROPIC_API_KEY not set. Add it as a repository secret (gh secret set ANTHROPIC_API_KEY -R ${GITHUB_REPOSITORY}) and pass it from the caller with 'secrets: ANTHROPIC_API_KEY: \${{ secrets.ANTHROPIC_API_KEY }}'. Secrets are also unavailable to PRs from forks."
+            exit 1
+          fi
+          echo "ANTHROPIC_API_KEY is set."
+
+      - name: Check out PR head with full history
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Fetch dev-pipeline prompt and scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.pipeline_repository }}
+          ref: ${{ inputs.pipeline_ref }}
+          path: .dev-pipeline
+          sparse-checkout: |
+            prompts
+            scripts
+      - name: Move dev-pipeline files out of the workspace
+        run: mv .dev-pipeline "$RUNNER_TEMP/dev-pipeline"
+
+      # Rebase detection: on a push to the PR, if the previous head is not an
+      # ancestor of the new one, the branch was rewritten (rebase/force-push).
+      - name: Build review context
+        id: ctx
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          ACTION: ${{ github.event.action }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          rebase_note="This push was not a rebase (or no previous head is known)."
+          if [ "$ACTION" = "synchronize" ] && [ -n "$BEFORE_SHA" ]; then
+            if ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "$BEFORE_SHA" 2>/dev/null || echo "Could not fetch previous head $BEFORE_SHA."
+            fi
+            if git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+              if git merge-base --is-ancestor "$BEFORE_SHA" "$HEAD_SHA"; then
+                rebase_note="This push added commits on top of the previous head ($BEFORE_SHA); no history was rewritten."
+              else
+                old_base=$(git merge-base "$BASE_SHA" "$BEFORE_SHA")
+                rebase_note="THE BRANCH WAS REBASED OR FORCE-PUSHED in this push. Previous head: $BEFORE_SHA. Compare before and after with: git range-diff $old_base..$BEFORE_SHA $merge_base..$HEAD_SHA"
+              fi
+            else
+              rebase_note="The previous head $BEFORE_SHA could not be fetched, so the branch was probably force-pushed. Treat this as a possible rebase and check the full diff with extra care."
+            fi
+          fi
+          template="$RUNNER_TEMP/dev-pipeline/prompts/reviewer.md"
+          delim="PROMPT_$(openssl rand -hex 16)"
+          {
+            echo "prompt<<$delim"
+            cat "$template"
+            echo
+            echo "## Context for this run"
+            echo
+            echo "- Repository: $GITHUB_REPOSITORY, PR #$PR_NUMBER"
+            echo "- Base commit: $BASE_SHA; merge base: $merge_base; head commit: $HEAD_SHA (checked out)"
+            echo "- See the full change with: git diff $merge_base $HEAD_SHA"
+            echo "- Changed files: git diff --stat $merge_base $HEAD_SHA"
+            echo "- Commits: git log --oneline $merge_base..$HEAD_SHA"
+            echo "- Rebase status: $rebase_note"
+            echo "$delim"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build reviewer arguments
+        id: args
+        env:
+          MODEL: ${{ inputs.model }}
+          MAX_TURNS: ${{ inputs.max_turns }}
+        run: |
+          schema='{"type":"object","additionalProperties":false,"required":["verdict","summary","findings"],"properties":{"verdict":{"type":"string","enum":["pass","block"]},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","file","title","detail"],"properties":{"severity":{"type":"string","enum":["blocking","warning","nit"]},"file":{"type":"string"},"line":{"type":"integer"},"title":{"type":"string"},"detail":{"type":"string"}}}}}}'
+          tools='Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git range-diff:*),Bash(git merge-base:*),Bash(git blame:*)'
+          {
+            echo "claude_args=--model $MODEL --max-turns $MAX_TURNS --allowedTools \"$tools\" --disallowedTools \"Write,Edit,NotebookEdit,WebFetch,WebSearch\" --json-schema '$schema'"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run independent review
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Read-only token: the action needs one, but the review is posted
+          # by the next step, not by Claude.
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.ctx.outputs.prompt }}
+          claude_args: ${{ steps.args.outputs.claude_args }}
+          display_report: "false"
+
+      - name: Post review and set verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEW: ${{ steps.claude.outputs.structured_output }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -z "$REVIEW" ]; then
+            echo "::error::The reviewer returned no structured output, so there is no verdict. Treating as a failure."
+            exit 1
+          fi
+          printf '%s' "$REVIEW" > "$RUNNER_TEMP/review.json"
+          verdict=$(node "$RUNNER_TEMP/dev-pipeline/scripts/post-review.mjs" "$RUNNER_TEMP/review.json" "$RUNNER_TEMP/review-body.md")
+          node -e '
+            const fs = require("fs");
+            fs.writeFileSync(process.argv[1], JSON.stringify({
+              commit_id: process.env.HEAD_SHA,
+              event: "COMMENT",
+              body: fs.readFileSync(process.argv[2], "utf8"),
+            }));
+          ' "$RUNNER_TEMP/review-request.json" "$RUNNER_TEMP/review-body.md"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" \
+            --input "$RUNNER_TEMP/review-request.json" --jq '.html_url'
+          cat "$RUNNER_TEMP/review-body.md" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$verdict" = "block" ]; then
+            echo "::error::Reviewer found blocking issues. See the PR review."
+            exit 1
+          fi
+          echo "Reviewer verdict: pass"
