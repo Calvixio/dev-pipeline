@@ -97,3 +97,4 @@ are not available to PRs from forks.
   [docs/agent-identity.md](docs/agent-identity.md#related-hardening-separate-ask-first).
 - **Tuning the reviewer**: edit `prompts/reviewer.md`.
 - **Default risk paths**: `config/risk-paths.default.yml`.
+- **Releasing**: tag, then move `v1`. See [docs/tag-ruleset.md](docs/tag-ruleset.md#releasing-a-new-version).
