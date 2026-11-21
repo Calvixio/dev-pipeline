@@ -56,11 +56,12 @@ on:
         type: boolean
         default: false
       supabase_cli_version:
+        description: Empty = use the version in the project lockfile (supabase devDependency), else latest.
         type: string
-        default: "2.116.0"
+        default: ""
       playwright_version:
         type: string
-        default: "1.56.1"
+        default: "1.64.1"
       pipeline_repository:
         description: Where to fetch the shared smoke script from.
         type: string
