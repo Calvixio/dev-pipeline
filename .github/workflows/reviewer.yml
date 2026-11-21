@@ -37,6 +37,17 @@ on:
       timeout_minutes:
         type: number
         default: 20
+      allowed_bots:
+        description: >-
+          Comma-separated GitHub App logins (with or without "[bot]") that may
+          trigger a review, passed to claude-code-action's allowed_bots. The
+          action matches the login that triggered the run (opened or pushed to
+          the PR) exactly, ignoring case. Empty (the default): any run a bot
+          triggers is refused, as before. Every bot listed can trigger a review
+          that spends the caller's Claude credential, so name each one; never
+          "*".
+        type: string
+        default: ""
     # Pass one of these. CLAUDE_CODE_OAUTH_TOKEN (a Claude subscription,
     # from `claude setup-token`) wins when both are set; ANTHROPIC_API_KEY
     # (Console, billed per token) is the fallback. A repo switches by
@@ -171,7 +182,11 @@ jobs:
 
       - name: Run independent review
         id: claude
-        uses: anthropics/claude-code-action@v1
+        # Pinned by commit SHA: this step receives the caller's Claude
+        # credential, so its code may change only through a dev-pipeline
+        # release. v1.0.286 (also tagged v1.0.285; what @v1 pointed to on
+        # 2026-11-21). See README, "Versions and pinning".
+        uses: anthropics/claude-code-action@acfe7992852970efb4fee683d63d628e3e52df67 # v1.0.286
         with:
           # Exactly one credential goes to the action: the OAuth token if set,
           # otherwise the API key. (Expressions in `with:` are not shell text.)
@@ -182,6 +197,8 @@ jobs:
           prompt: ${{ steps.ctx.outputs.prompt }}
           claude_args: ${{ steps.args.outputs.claude_args }}
           display_report: "false"
+          # Empty unless the caller names bots; see the input.
+          allowed_bots: ${{ inputs.allowed_bots }}
 
       - name: Check the reviewer returned a verdict
         env:

@@ -66,6 +66,14 @@ Tags only resist tampering once the tag ruleset is applied: release tags
 can't be moved or deleted, and only admins can move `v1`. See
 [docs/tag-ruleset.md](docs/tag-ruleset.md) (applying it is Ask first).
 
+**Third-party actions that receive a secret are pinned by commit SHA too.**
+`reviewer.yml` hands the caller's Claude credential to
+`anthropics/claude-code-action`, so it uses a full commit SHA with a comment
+naming the version, never a moving tag like `@v1`. Its code can then change
+only through a dev-pipeline release. To upgrade: resolve the new version with
+`git ls-remote https://github.com/anthropics/claude-code-action 'refs/tags/vX.Y.Z^{}'`,
+read its changes, update the SHA and the comment in one PR, and release.
+
 ## Reviewer auth
 
 `reviewer.yml` accepts either secret. If both are set, it uses
