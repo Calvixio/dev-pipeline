@@ -31,7 +31,18 @@ if (!review || !VERDICTS.has(review.verdict) || !Array.isArray(review.findings))
 const hasBlocking = review.findings.some((f) => f.severity === "blocking");
 const verdict = review.verdict === "block" || hasBlocking ? "block" : "pass";
 
-const clean = (s) => String(s ?? "").replace(/\r/g, "").trim();
+// Redact anything token-shaped before it is posted publicly, in case the
+// reviewer quoted a secret it found in the diff.
+const TOKEN_PATTERNS = [
+  /\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g,
+  /\bsk-ant-[A-Za-z0-9_-]{10,}/g,
+  /\b(sk|rk|pk)_(live|test)_[A-Za-z0-9]{10,}/g,
+  /\bwhsec_[A-Za-z0-9]{10,}/g,
+  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
+  /\bAKIA[0-9A-Z]{16}\b/g,
+];
+const redact = (s) => TOKEN_PATTERNS.reduce((acc, rx) => acc.replace(rx, "[redacted]"), s);
+const clean = (s) => redact(String(s ?? "").replace(/\r/g, "").trim());
 const lines = [
   `## Independent review: ${verdict === "block" ? "❌ blocking issues found" : "✅ no blocking issues"}`,
   "",
