@@ -59,7 +59,7 @@ jobs:
       # No checkout of the PR: only the API is read, so nothing from the PR
       # can execute in this job.
       - name: Fetch dev-pipeline defaults and scripts
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ inputs.pipeline_repository }}
           ref: ${{ inputs.pipeline_ref }}
