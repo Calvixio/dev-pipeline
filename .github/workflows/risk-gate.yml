@@ -16,6 +16,15 @@ name: risk-gate
 #
 # Callers trigger this on pull_request AND pull_request_review, so that an
 # approval re-runs the gate.
+#
+# TRUST BOUNDARY: on pull_request the caller workflow file comes from the PR
+# head, so a PR could edit its caller (approvers, pipeline_ref, or remove the
+# job). This gate alone cannot stop that. The backstop is CODEOWNERS (read by
+# GitHub from the base branch) covering .github/**, plus branch protection's
+# "Require review from Code Owners" (scripts/set-branch-protection.sh turns it
+# on): any PR that edits a workflow needs the code owner's review, whatever
+# the workflow says. A stronger fix is an org ruleset "required workflow"
+# pinned to a dev-pipeline ref; see docs/agent-identity.md.
 
 on:
   workflow_call:
