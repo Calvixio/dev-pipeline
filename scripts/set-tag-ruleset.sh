@@ -94,12 +94,13 @@ existing_id() {
 }
 
 upsert() {
-  local name="$1" payload="$2" id
+  local name="$1" payload="$2" id mode
   id=$(existing_id "$name")
+  if [ "$apply" -eq 1 ]; then mode="Applying:"; else mode="Dry run, would"; fi
   if [ -n "$id" ]; then
-    echo "== Would UPDATE ruleset $id \"$name\" (PUT repos/$repo/rulesets/$id)"
+    echo "== $mode UPDATE ruleset $id \"$name\" (PUT repos/$repo/rulesets/$id)"
   else
-    echo "== Would CREATE ruleset \"$name\" (POST repos/$repo/rulesets)"
+    echo "== $mode CREATE ruleset \"$name\" (POST repos/$repo/rulesets)"
   fi
   echo "$payload"
   [ "$apply" -eq 1 ] || return 0
