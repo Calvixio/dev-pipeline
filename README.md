@@ -19,8 +19,8 @@ adopts them with short caller files. This repo holds no secrets.
 3. Set `smoke_paths` to the home page, a data-backed page and a gated or
    signed-in page. Add `use_supabase: true` if the app needs a database
    ([seed convention](docs/seed-data.md)).
-4. Add the `ANTHROPIC_API_KEY` repository secret (Dan does this; never through chat):
-   `gh secret set ANTHROPIC_API_KEY -R OWNER/REPO`.
+4. Add **one** reviewer credential as a repository secret (Dan does this;
+   never through chat). See [Reviewer auth](#reviewer-auth).
 5. Optional: `templates/risk-paths.yml` → `.github/risk-paths.yml` for extra
    ask-first paths. `templates/CODEOWNERS` → `.github/CODEOWNERS`.
 6. Open a PR and confirm every check runs and is green.
@@ -46,6 +46,26 @@ jobs:
         /
         /account | Sign in
 ```
+
+## Reviewer auth
+
+`reviewer.yml` accepts either secret. If both are set, it uses
+`CLAUDE_CODE_OAUTH_TOKEN`. To switch, swap which one the repo has. The
+caller template passes both.
+
+| Secret | Where it comes from | Cost |
+| --- | --- | --- |
+| `CLAUDE_CODE_OAUTH_TOKEN` | `claude setup-token` on a Claude subscription | **Draws on that subscription's usage limits**: every PR review uses the same allowance as interactive Claude Code, and a busy day of PRs can run it down. |
+| `ANTHROPIC_API_KEY` | Claude Console API key (cap its spend in the Console) | Billed per token, separate from any subscription. |
+
+```sh
+gh secret set CLAUDE_CODE_OAUTH_TOKEN -R OWNER/REPO   # prompts for the value
+# or
+gh secret set ANTHROPIC_API_KEY -R OWNER/REPO
+```
+
+If neither is set, the review job fails with a message naming both. Secrets
+are not available to PRs from forks.
 
 ## Things to know
 

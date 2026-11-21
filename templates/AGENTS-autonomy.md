@@ -20,7 +20,8 @@ data, secrets, billing, the pipeline itself, force-pushes) is still
       Calvixio/dev-pipeline, including the local preview page check.
 - [ ] Playwright smoke paths cover the home page, a data-backed page and an
       authenticated or gated page.
-- [ ] Reviewer pass: `reviewer` runs on every PR with an `ANTHROPIC_API_KEY`.
+- [ ] Reviewer pass: `reviewer` runs on every PR with a `CLAUDE_CODE_OAUTH_TOKEN` or
+      `ANTHROPIC_API_KEY` secret.
 - [ ] `risk-gate` runs on PRs and reviews; `.github/risk-paths.yml` lists this
       repo's extra ask-first paths.
 - [ ] Branch protection on `main` (`scripts/set-branch-protection.sh`): the

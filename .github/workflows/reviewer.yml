@@ -37,10 +37,15 @@ on:
       timeout_minutes:
         type: number
         default: 20
+    # Pass one of these. CLAUDE_CODE_OAUTH_TOKEN (a Claude subscription,
+    # from `claude setup-token`) wins when both are set; ANTHROPIC_API_KEY
+    # (Console, billed per token) is the fallback. A repo switches by
+    # swapping which secret it sets. Neither is required here, so a missing
+    # secret fails with a clear message instead of a generic workflow error.
     secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
       ANTHROPIC_API_KEY:
-        # Not required here so a missing key fails with a clear message
-        # instead of a generic workflow error.
         required: false
 
 permissions:
@@ -57,18 +62,23 @@ jobs:
     outputs:
       review: ${{ steps.claude.outputs.structured_output }}
     steps:
-      - name: Check ANTHROPIC_API_KEY is set
+      # Secrets reach this script only through env. Never write a ${{ }}
+      # expression inside run: text, even escaped or as help text: GitHub
+      # expands it before the shell sees it, which would paste the secret
+      # into the script. Only which secret is present is ever printed.
+      - name: Check a Claude credential is set
         env:
+          OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        # Never write a ${{ }} expression inside run: text, even escaped or
-        # as help text: GitHub expands it before the shell sees it, and here
-        # that would paste the secret into the script.
         run: |
-          if [ -z "$KEY" ]; then
-            echo "::error title=ANTHROPIC_API_KEY not set::ANTHROPIC_API_KEY not set. Add it as a repository secret (gh secret set ANTHROPIC_API_KEY -R ${GITHUB_REPOSITORY}) and pass it from the caller under 'secrets:' as in templates/workflows/pr-checks.yml. Secrets are also unavailable to PRs from forks."
+          if [ -n "$OAUTH" ]; then
+            echo "Using CLAUDE_CODE_OAUTH_TOKEN (Claude subscription; counts against its usage limits)."
+          elif [ -n "$KEY" ]; then
+            echo "Using ANTHROPIC_API_KEY (Console API key, billed per token)."
+          else
+            echo "::error title=No Claude credential set::Neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set. Add one as a repository secret (gh secret set CLAUDE_CODE_OAUTH_TOKEN -R ${GITHUB_REPOSITORY}, or gh secret set ANTHROPIC_API_KEY -R ${GITHUB_REPOSITORY}) and pass it from the caller under 'secrets:' as in templates/workflows/pr-checks.yml. Secrets are also unavailable to PRs from forks."
             exit 1
           fi
-          echo "ANTHROPIC_API_KEY is set."
 
       - name: Check out PR head with full history
         uses: actions/checkout@v7
@@ -163,7 +173,10 @@ jobs:
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Exactly one credential goes to the action: the OAuth token if set,
+          # otherwise the API key. (Expressions in `with:` are not shell text.)
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN == '' && secrets.ANTHROPIC_API_KEY || '' }}
           # This job's token is contents: read only.
           github_token: ${{ github.token }}
           prompt: ${{ steps.ctx.outputs.prompt }}
