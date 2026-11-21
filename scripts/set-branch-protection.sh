@@ -35,7 +35,10 @@ while [ $# -gt 0 ]; do
     --check) checks+=("${2:?--check needs a value}"); shift ;;
     -h|--help) usage 0 ;;
     -*) echo "Unknown option: $1" >&2; usage 1 ;;
-    *) [ -z "$repo" ] && repo="$1" || { echo "Unexpected argument: $1" >&2; usage 1; } ;;
+    *)
+      if [ -n "$repo" ]; then echo "Unexpected argument: $1" >&2; usage 1; fi
+      repo="$1"
+      ;;
   esac
   shift
 done
@@ -61,7 +64,10 @@ fi
 payload=$(node -e '
   const checks = process.argv.slice(1);
   process.stdout.write(JSON.stringify({
-    required_status_checks: { strict: true, contexts: checks },   // strict = branch must be up to date
+    // strict = branch must be up to date. app_id 15368 is the GitHub Actions
+    // app: the check must come from a workflow run, not a status posted
+    // with some other token.
+    required_status_checks: { strict: true, checks: checks.map((context) => ({ context, app_id: 15368 })) },
     enforce_admins: true,                                          // no --admin bypass, for anyone
     required_pull_request_reviews: {
       require_code_owner_reviews: true,   // CODEOWNERS paths (.github/**, rules files) need the owner
@@ -90,4 +96,4 @@ echo "Applying..."
 printf '%s' "$payload" | gh api --method PUT "repos/$repo/branches/$branch/protection" --input - >/dev/null
 echo "Done. Current protection:"
 gh api "repos/$repo/branches/$branch/protection" \
-  --jq '{strict: .required_status_checks.strict, checks: .required_status_checks.contexts, code_owners: .required_pull_request_reviews.require_code_owner_reviews, dismiss_stale: .required_pull_request_reviews.dismiss_stale_reviews, enforce_admins: .enforce_admins.enabled}'
+  --jq '{strict: .required_status_checks.strict, checks: [.required_status_checks.checks[] | "\(.context) (app \(.app_id))"], code_owners: .required_pull_request_reviews.require_code_owner_reviews, dismiss_stale: .required_pull_request_reviews.dismiss_stale_reviews, enforce_admins: .enforce_admins.enabled}'

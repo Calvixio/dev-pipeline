@@ -143,6 +143,8 @@ jobs:
             if [ "${TOO_MANY_FILES:-0}" = 1 ]; then
               echo "3000 or more files changed; too many to classify, so treated as ask-first."
             fi
+            # ${} below is a JS template literal, not a shell expansion.
+            # shellcheck disable=SC2016
             node -e '
               const r = require(process.argv[1]);
               if (r.askFirst.length) {
