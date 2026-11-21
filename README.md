@@ -15,7 +15,8 @@ adopts them with short caller files. This repo holds no secrets.
 
 1. Copy `templates/workflows/pr-checks.yml`, `risk-gate.yml` (and later
    `deploy.yml`) into the project's `.github/workflows/`.
-2. Pin `@ref` **and** `pipeline_ref` to the same dev-pipeline tag or SHA.
+2. Pin `uses: …@v1` **and** `pipeline_ref: v1` (the templates already do).
+   Never pin to a branch. See [Versions and pinning](#versions-and-pinning).
 3. Set `smoke_paths` to the home page, a data-backed page and a gated or
    signed-in page. Add `use_supabase: true` if the app needs a database
    ([seed convention](docs/seed-data.md)).
@@ -38,14 +39,32 @@ on:
   pull_request:
 jobs:
   ci:
-    uses: Calvixio/dev-pipeline/.github/workflows/ci-opennext.yml@<sha-or-tag>
+    uses: Calvixio/dev-pipeline/.github/workflows/ci-opennext.yml@v1
     permissions: { contents: read }
     with:
-      pipeline_ref: <sha-or-tag>
+      pipeline_ref: v1
       smoke_paths: |
         /
         /account | Sign in
 ```
+
+## Versions and pinning
+
+| Ref | Moves? | Use it when |
+| --- | --- | --- |
+| `v1` | Yes, to each v1.x release | Default for projects: picks up fixes without editing callers. |
+| `v1.0.0`, `v1.0.1`, … | Never | You want to choose when to upgrade. |
+| A release's commit SHA | Never, and can't be faked | **Strongest pin.** Nothing anyone pushes later can change what runs with your secrets. |
+| A branch (`main`, feature branches) | On every push | **Never.** Whatever is on the branch receives the caller's secrets. |
+
+Find a release's SHA with
+`git ls-remote https://github.com/Calvixio/dev-pipeline refs/tags/v1.0.0^{}`.
+Whatever you pin, set `pipeline_ref` to the same value. It defaults to `v1`,
+never `main`.
+
+Tags only resist tampering once the tag ruleset is applied: release tags
+can't be moved or deleted, and only admins can move `v1`. See
+[docs/tag-ruleset.md](docs/tag-ruleset.md) (applying it is Ask first).
 
 ## Reviewer auth
 
@@ -78,3 +97,4 @@ are not available to PRs from forks.
   [docs/agent-identity.md](docs/agent-identity.md#related-hardening-separate-ask-first).
 - **Tuning the reviewer**: edit `prompts/reviewer.md`.
 - **Default risk paths**: `config/risk-paths.default.yml`.
+- **Releasing**: tag, then move `v1`. See [docs/tag-ruleset.md](docs/tag-ruleset.md#releasing-a-new-version).
