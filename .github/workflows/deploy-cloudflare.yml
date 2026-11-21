@@ -66,9 +66,9 @@ on:
         type: string
         default: Calvixio/dev-pipeline
       pipeline_ref:
-        description: Keep this equal to the @ref in your `uses:` line.
+        description: Keep this equal to the @ref in your `uses:` line. Defaults to the v1 tag, never main, so a caller that forgets it does not run unreleased scripts.
         type: string
-        default: main
+        default: v1
     secrets:
       CLOUDFLARE_API_TOKEN:
         required: true
