@@ -60,9 +60,12 @@ jobs:
       - name: Check ANTHROPIC_API_KEY is set
         env:
           KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        # Never write a ${{ }} expression inside run: text, even escaped or
+        # as help text: GitHub expands it before the shell sees it, and here
+        # that would paste the secret into the script.
         run: |
           if [ -z "$KEY" ]; then
-            echo "::error title=ANTHROPIC_API_KEY not set::ANTHROPIC_API_KEY not set. Add it as a repository secret (gh secret set ANTHROPIC_API_KEY -R ${GITHUB_REPOSITORY}) and pass it from the caller with 'secrets: ANTHROPIC_API_KEY: \${{ secrets.ANTHROPIC_API_KEY }}'. Secrets are also unavailable to PRs from forks."
+            echo "::error title=ANTHROPIC_API_KEY not set::ANTHROPIC_API_KEY not set. Add it as a repository secret (gh secret set ANTHROPIC_API_KEY -R ${GITHUB_REPOSITORY}) and pass it from the caller under 'secrets:' as in templates/workflows/pr-checks.yml. Secrets are also unavailable to PRs from forks."
             exit 1
           fi
           echo "ANTHROPIC_API_KEY is set."
